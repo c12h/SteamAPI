@@ -1,0 +1,17 @@
+# Emacs & Coreutils backups
+*~
+
+# Emacs auto-save files
+.#*
+\#*#
+
+# OSX specific files
+.DS_Store
+
+# generated files and directories
+build/*
+*.log
+*.pid
+*.prof
+*.test
+
