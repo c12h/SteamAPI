@@ -2,20 +2,25 @@
 // a convenient form, using a local cache.
 //
 // The Steam web API at “http://api.steampowered.com/ISteamApps/GetAppList/v2/”
-// returns the name and numeric ID of all the current Steam apps as multiple
-// megabytes of JSON (without any line breaks!). Therefore, this package caches
-// the information in per-user storage, using a ‘Terse’ text format which is
-// much smaller and easier to parse.
+// returns the name and numeric ID of all the Steam apps ever registered as
+// multiple megabytes of JSON (without any line breaks!). Therefore, this
+// package caches the information in per-user storage, using a ‘Terse’ text
+// format which is much smaller and easier to parse.
 //
-// There are two functions to get AppList structs.  Programs which don't need
-// up-to-date information can call LatestCached(). To get the big app list as of
-// at most n hours ago, use FromCacheOrWeb(n).
+// NOTE: many of the registered names never became products. Others have been
+// discontinued or folded into other apps (commonly when DLC is made part of its
+// parent app). Some names may have typos; this list apparently is not updated
+// when a publisher changes the name of an app. You have been warned.
 //
-// Due to the widespread confusion between Microsoft’s ‘Western’ character set
-// (CP1252) and Unicode, some names contain byte values 0x92 and 0x95, which
-// mean "’" (U+2019 and "™" (U+2122) respectively in CP1252. This module translates
-// them to proper UTF-8.
-//	WHAT ABOUT \t then? See app 1089230.
+// This package provides two functions to get AppList structs.  Programs which
+// don't need up-to-date information can call LatestCached(). To get the big app
+// list as of at most n hours ago, use FromCacheOrWeb(n).
+//
+// Some names contain UTF8 sequences for codepoints U+0092 and U+0099, which are
+// control characters, but represent "’" (U+2019 and "™" (U+2122) respectively in
+// CP1252, Microsoft’s ‘Western’ character set. This module translates them to
+// proper Unicode. (It also removes trailing tabs (U+0009) from app names, which
+// as of this writing only affects 1 defunct app, 1089230.)
 //
 //
 // Size Considerations

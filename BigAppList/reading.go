@@ -5,13 +5,16 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"time"
 )
 
-/*============================ Loading the Lists =============================*/
+/*============================= Reading the JSON =============================*/
 
+// FromJSON returns an AppList it creates by parsing JSON text from an io.Reader,
+// or an error, but not both.
 func FromJSON(r io.Reader, source string, isFile bool) (*AppList, error) {
 	const (
 		formatStart   = `{"applist":{"apps":[{"appid":%d,"name":%q}`
@@ -21,7 +24,7 @@ func FromJSON(r io.Reader, source string, isFile bool) (*AppList, error) {
 	)
 
 	al := new(AppList)
-
+	al.AsOf = time.Now().UTC()
 	bufReader := bufio.NewReader(r)
 	var number int64
 	var name string
@@ -34,11 +37,11 @@ func FromJSON(r io.Reader, source string, isFile bool) (*AppList, error) {
 			"scanf() of", source, isFile,
 			" with format %q → %d, %q\n", formatStart, n, err,
 		)
-		return nil, &ParseError{
-			AtStart: true, Source: source, IsFile: isFile, Excerpt: s}
+		return nil, &JSONParseError{AtStart: true, Excerpt: s,
+			Source: source, IsFile: isFile}
 	} else if err != nil {
-		return nil, &ReadError{Source: source, IsFile: isFile,
-			AtStart: true, BaseError: err}
+		return nil, &ReadError{AtStart: true, BaseError: err,
+			Source: source, IsFile: isFile}
 	} else {
 		maybeInsert(number, name, al, source, isFile)
 	}
@@ -52,18 +55,28 @@ func FromJSON(r io.Reader, source string, isFile bool) (*AppList, error) {
 			logBug(s,
 				"scanf() of", source, isFile,
 				" with format %q → %d, %q\n", formatLater, n, err)
-			return nil, &ParseError{
-				Source: source, IsFile: isFile, Excerpt: s}
+			return nil, &JSONParseError{Excerpt: s,
+				Source: source, IsFile: isFile}
 		} else if err != nil {
-			return nil, &ReadError{Source: source, IsFile: isFile,
-				BaseError: err}
+			return nil, &ReadError{BaseError: err,
+				Source: source, IsFile: isFile}
 		} else {
+			// For defunct app 1089230
+			last := len(name) - 1
+			if name[last] == '\t' {
+				name = name[:last]
+			}
+			posC2 := strings.IndexByte(name, 0xC2)
+			if posC2 >= 0 {
+				name = fixCP1252(name, posC2, number, source, isFile)
+			}
 			maybeInsert(number, name, al, source, isFile)
 		}
 
 	}
 
-	return finishAppList(al, time.Now().Unix())
+	finishAppList(al)
+	return al, nil
 }
 
 func peek(bufReader *bufio.Reader, limit int) []byte {
@@ -74,49 +87,173 @@ func peek(bufReader *bufio.Reader, limit int) []byte {
 	return ret
 }
 
-func FromSimpleFormat(r io.Reader, source string, isFile bool) (*AppList, error) {
+func fixCP1252(s string, posC2 int, number int64, source string, isFile bool) string {
+	newB := make([]byte, 0, len(s)+2)
+	for posC2 >= 0 {
+		newB = append(newB, s[:posC2]...)
+		switch s[posC2+1] {
+		case 0x99:
+			newB = append(newB, "™"...)
+		case 0x92:
+			newB = append(newB, "’"...)
+		default:
+			code := s[posC2+1]
+			newB = append(newB, 0xC2, code)
+			if code < 0xA0 {
+				logBug(nil, "In", source, isFile,
+					"name for app %d contains weird char %X",
+					number, s[posC2+1])
+			}
+		}
+		s = s[posC2+2:]
+		posC2 = strings.IndexByte(s, 0xC2)
+	}
+	newB = append(newB, s...)
+	return string(newB)
+}
+
+/*======================== Reading the Terse Format =========================*/
+
+const (
+	toEOF       = 0
+	unknownTime = 0
+)
+
+// FromTerseFile reads a text file containing an AppList in the 'terse format'.
+func FromTerseFile(fileSpec string) (*AppList, error) {
+	fh, err := os.Open(fileSpec)
+	if err != nil {
+		return nil, &CacheError{
+			Action: "open file", Path: fileSpec, BaseError: err}
+	}
+	defer fh.Close()
+	return FromTerseFormat(fh, toEOF, fileSpec, true)
+}
+
+// FromTerseFormat reads the preferred textual form of an AppList from any
+// io.Reader.
+func FromTerseFormat(r io.Reader, ender byte, source string, isFile bool,
+) (*AppList, error) {
+	lr := &lineReader{bufReader: bufio.NewReader(r), source: source, isFile: isFile}
+	return fromTerseFormat(lr, ender)
+}
+
+// Some callers will be reading terse-format app lists from TCP sockets, so we
+// cannot use a bufio.Scanner (which "may [advance] arbitrarily far past the
+// last token"). Instead, we use a bufio.Reader instead a convenient struct.
+//
+type lineReader struct {
+	bufReader *bufio.Reader
+	source    string
+	isFile    bool
+	seenEOF   bool
+	lineNum   int
+}
+
+// readLine returns (line, atEOF, error) but only in these combinations:
+//	(someBytes, false, nil)		the normal case
+//	(nil,       false, nil)		an empty line
+//	(someBytes, false, non-nil)	error after reading partial line
+//	(nil,       false, non-nil)	read error, no partial line
+//	(nil,       true,  ?)		EOF reached.
+// It always removes any terminating \n or \r\n from line.
+//
+func readLine(lr *lineReader) ([]byte, bool, error) {
+	if lr.seenEOF {
+		return nil, true, nil
+	}
+	line, err := lr.bufReader.ReadBytes('\n')
+	if err == io.EOF {
+		if len(line) == 0 {
+			return nil, true, nil
+		}
+		lr.seenEOF = true
+		err = nil
+	}
+	if n := len(line); n > 1 && line[n-1] == '\n' {
+		if n > 2 && line[n-2] == '\r' {
+			n--
+		}
+		line = line[:n-1]
+	}
+	lr.lineNum++
+	return line, false, err
+}
+
+// fromTerseFormat reads a text stream defining an AppList.
+func fromTerseFormat(lr *lineReader, ender byte) (*AppList, error) {
 	al := new(AppList)
 
-	s := bufio.NewScanner(r)
-
-	var unixTime int64
-	if !s.Scan() {
-		return nil, &ReadError{IsEmpty: true, Source: source, IsFile: isFile}
+	line, eof, err := readLine(lr)
+	if eof {
+		return nil, &ReadError{IsEmpty: true,
+			Source: lr.source, IsFile: lr.isFile}
 	}
-	// parse date+time from first line
+	headerTime, problem := int64(0), ""
+	match := regexpHeaderLine.FindSubmatch(line)
+	if match == nil {
+		problem = "is not like ‘" + formatHeaderLine + `’`
+	} else {
+		t, err := time.Parse(formatHeaderTime, string(match[1]))
+		if err != nil {
+			problem = fmt.Sprintf("has bad timestamp %q: %s",
+				match[1], err)
+		} else {
+			headerTime = t.Unix()
+		}
+	}
+	if problem != "" {
+		return nil, &TerseFormatError{HeaderProblem: problem,
+			LineNum: 1, Line: string(line),
+			Source: lr.source, IsFile: lr.isFile}
+	}
+	al.AsOf = time.Unix(headerTime, 0)
 
-	nameBuf := make([]byte, 0, 10) //#D#: later: 512
-	for s.Scan() {
-		line := s.Bytes()
+	for {
+		line, eof, err = readLine(lr)
+		if err != nil {
+			// read to EOF / ender ...???XXX
+			return nil, &ReadError{Source: lr.source, IsFile: lr.isFile,
+				BaseError: err}
+		}
+		if eof {
+			break
+		}
+
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		} else if ender != toEOF && line[0] == ender && len(line) == 1 {
+			// read to EOF / ender ...???XXX
+			break
+		}
+
 		i, number := 0, int64(0)
 		name := ""
-		for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+		for ; i < len(line) && line[i] >= '0' && line[i] <= '9'; i++ {
 			number *= 10
 			number += int64(line[i] - '0')
 		}
-		if i > 0 || i < len(line) || line[i] == '\t' {
-			if cap(nameBuf) < len(line) {
-				nameBuf = make([]byte, 1, 2*len(line))
-			} else {
-				nameBuf = nameBuf[:1]
-			}
-			nameBuf[0] = '"'
-			nameBuf = append(nameBuf, line[i+1:]...)
-			nameBuf = append(nameBuf, '"')
-			n, err := fmt.Fscanf(bytes.NewReader(nameBuf), "%q", &name)
+		if i > 0 && i < len(line) && line[i] == '\t' {
+			line[i] = '"'
+			line = append(line, '"') // Goes where CR/LF was.
+			n, err := fmt.Fscanf(bytes.NewReader(line[i:]), "%q", &name)
 			if n < 1 || err != nil {
 				name = ""
 			}
 		}
 		if number <= 0 || number > maxAppID || name == "" {
-			return nil, &ParseError{
-				Excerpt: line, Source: source, IsFile: isFile}
+			return nil, &TerseFormatError{
+				Line: string(line), LineNum: lr.lineNum,
+				Source: lr.source, IsFile: lr.isFile}
 		}
-		maybeInsert(number, name, al, source, isFile)
+		maybeInsert(number, name, al, lr.source, lr.isFile)
 	}
 
-	return finishAppList(al, unixTime)
+	finishAppList(al)
+	return al, nil
 }
+
+/*======================== Building the AppList value ========================*/
 
 func maybeInsert(number int64, name string, al *AppList, source string, isFile bool) {
 	if number == 0 {
@@ -128,6 +265,7 @@ func maybeInsert(number int64, name string, al *AppList, source string, isFile b
 			source, isFile, "")
 		return
 	}
+
 	appID := SteamAppID(number)
 	al.ByAppNum = append(al.ByAppNum, NameAndNumber{Name: name, ID: appID})
 	al.ByNameMC = append(al.ByNameMC, NameAndNumber{Name: name, ID: appID})
@@ -135,9 +273,10 @@ func maybeInsert(number int64, name string, al *AppList, source string, isFile b
 	al.ByNameUC = append(al.ByNameUC, NameAndNumber{Name: name, ID: appID})
 }
 
-func finishAppList(al *AppList, unixTime int64) (*AppList, error) {
+// finishAppList finishes setting up an AppList after reading one from JSON or the
+// terse format, notably by sorting the component lists.
+func finishAppList(al *AppList) {
 	al.Count = len(al.ByAppNum)
-	al.AsOf = time.Unix(unixTime, 0)
 
 	sort.Sort(listByAppNum(al.ByAppNum))
 	sort.Sort(listByAppNum(al.ByNameMC))
@@ -148,11 +287,7 @@ func finishAppList(al *AppList, unixTime int64) (*AppList, error) {
 	al.ByAppNum = append(al.ByAppNum, nullItem)
 	al.ByNameMC = append(al.ByNameMC, nullItem)
 	al.ByNameUC = append(al.ByNameUC, nullItem)
-
-	return al, nil
 }
-
-/*============================ Sorting the Lists =============================*/
 
 type (
 	listByAppNum NameNumberList
@@ -172,12 +307,13 @@ func (l listByNameUC) Swap(i, j int)      { l[i], l[j] = l[j], l[i] }
 
 /*================================== Errors ==================================*/
 
+// ReadError represents an I/O error while reading something.
 type ReadError struct {
-	Source    string
-	IsFile    bool
-	AtStart   bool
-	IsEmpty   bool
-	BaseError error
+	Source    string // Where the text came from.
+	IsFile    bool   // Whether Source is a file path.
+	AtStart   bool   // Whether the first read failed.
+	IsEmpty   bool   // Whether the file or reader seems to be empty.
+	BaseError error  // The wrapped error from the actual io.Reader.
 }
 
 func (e *ReadError) Error() string {
@@ -197,14 +333,15 @@ func (e *ReadError) Unwrap() error { return e.BaseError }
 
 //
 
-type ParseError struct {
+// JSONParseError represents a problem parsing the JSON form of a BigAppList.
+type JSONParseError struct {
 	Source  string
 	IsFile  bool
 	AtStart bool
 	Excerpt []byte
 }
 
-func (e *ParseError) Error() string {
+func (e *JSONParseError) Error() string {
 	source := e.Source
 	if e.IsFile {
 		source = fmt.Sprintf("file %q", e.Source)
@@ -222,4 +359,30 @@ func (e *ParseError) Error() string {
 
 	return fmt.Sprintf("cannot parse %q from %s as JSON from GetAppList",
 		source, sample)
+}
+
+//
+
+// TerseFormatError represents a problem parsing the terse text form of a BigAppList.
+//
+// The Line field is the offending line. Our Error() method ignores it, but some
+// callers may want to report it along with the Error() string.
+//
+type TerseFormatError struct {
+	Source        string // Where the text came from.
+	IsFile        bool   // Whether Source is a file path.
+	LineNum       int    // Which line we found problematic (1-origin).
+	Line          string // The problematic line itself, for any interested callers.
+	HeaderProblem string // If non-empty, what is wrong with the first line.
+}
+
+func (e *TerseFormatError) Error() string {
+	source := e.Source
+	if e.IsFile {
+		source = fmt.Sprintf("file %q", e.Source)
+	}
+	if e.HeaderProblem != "" {
+		return fmt.Sprintf("header line from %s %s", source, e.HeaderProblem)
+	}
+	return fmt.Sprintf("cannot parse line %d from %s: %q", e.LineNum, source, e.Line)
 }

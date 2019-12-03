@@ -1,40 +1,4 @@
-// Package bigapplist provides Steam’s massive list of app names and numbers in
-// a convenient form, using a local cache.
-//
-// The Steam web API at “http://api.steampowered.com/ISteamApps/GetAppList/v2/”
-// returns the name and numeric ID of all the current Steam apps as multiple
-// megabytes of JSON (without any line breaks!). Therefore, this package caches
-// the information in per-user storage, using a ‘Simple’ text format which is
-// much smaller and easier to parse.
-//
-// There are two functions to get AppList structs.  Programs which don't need
-// up-to-date information can call LatestCached(). To get the big app list as of
-// at most n hours ago, use FromCacheOrWeb(n).
-//
-//
-// Size Considerations
-//
-// This list really is quite large. At one stage during November 2019, the JSON
-// from GetAppList had ~87,000 names containing ~3,145,000 characters in
-// ~3,188,000 bytes. The longest name, for app # 1009190, was 114 characters and
-// 289 bytes long. The JSON form was 4.7MB long; the simple form was 3.3MB.
-// Moreover, this list keeps on growing: in March 2019, it was only ~77,000 apps
-// and 4.1MB of JSON.
-//
-//
-// The Simple File Format
-//
-// The Simple format consists of one header line followed by one line per known
-// app. The header line gives the URL used and the date and time of the download:
-//   # Data from URL as of YYYY-MM-DD HH:MM:SSZ
-// where the Z is literal.
-//
-// The following lines contain (1) the app ID as a decimal number, (2) a tab and
-// (3) the app name as written by the %q verb but with the leading and trailing
-// '"' characters removed. This means that certain characters in names will be
-// represented by backslash escapes; notably ‘"’ will appear as ‘\"’.
-//
-package BigAppList // import "github.com/c12h/SteamAPI/BigAppList"
+package BigAppList
 
 import (
 	"fmt"
@@ -55,14 +19,6 @@ import (
 const URL = "http://api.steampowered.com/ISteamApps/GetAppList/v2/"
 
 //
-
-const (
-	ourDirName          = "BigAppLists"
-	cacheFileNameFormat = `BigAppList@%d.txt`
-	cacheFileNameRegexp = `^BigAppList@(\d+).txt$`
-)
-
-var ourCacheDir = filepath.Join(steamAPI.CacheDirPath(), ourDirName)
 
 /*======================= Exported Types and Constants =======================*/
 
@@ -111,11 +67,6 @@ func FromCache() (*AppList, error) {
 	return FromCacheOrWeb(LongLongAgo)
 }
 
-var (
-	regexpCacheName = regexp.MustCompile(`^SteamAppList@(\d+)\.txt$`)
-	formatCacheName = "SteamAppList@%d.txt"
-)
-
 // Function bigappslist.FromCacheOrWeb(N) returns the latest version of Steam's
 // app list from the cache if it is no more than N hours old. Otherwise, it
 // downloads the current version of the list from Steam, caches it and returns
@@ -126,12 +77,14 @@ var (
 // or even 7*24 might be kinder to some users.
 //
 func FromCacheOrWeb(maxAgeHours uint32) (*AppList, error) {
+	steamAPI.EnsureDirExists(ourCacheDir)
 	dh, err := os.Open(ourCacheDir)
 	if err != nil {
 		return nil, &CacheError{
 			Action: "open directory", Path: ourCacheDir, BaseError: err}
 	}
 
+	cutoff := time.Now().UTC().Unix() - 60*60*int64(maxAgeHours)
 	entries, err := dh.Readdir(-1)
 	if err != nil {
 		return nil, &CacheError{
@@ -139,30 +92,34 @@ func FromCacheOrWeb(maxAgeHours uint32) (*AppList, error) {
 	}
 
 	var newestFile os.FileInfo
-	var newestModTime int64 = 0
+	var latestTime int64 = 0 // value is seconds since the Unix epoch
 	for _, fi := range entries {
 		if m := regexpCacheName.FindStringSubmatch(fi.Name()); m != nil {
-			modTimeFromName, err := strconv.ParseInt(m[1], 10, 64)
-			if err != nil && modTimeFromName > newestModTime {
-				newestFile, newestModTime = fi, modTimeFromName
+			timeFromName, err := strconv.ParseInt(m[1], 10, 64)
+			if err == nil && timeFromName > latestTime {
+				newestFile, latestTime = fi, timeFromName
 			}
 		}
 	}
-	if newestFile != nil {
-		return FromSimpleFile(filepath.Join(ourCacheDir, newestFile.Name()))
-	} else {
+	if newestFile == nil || latestTime < cutoff {
 		return fetchAndCache()
 	}
-}
-
-func FromSimpleFile(path string) (*AppList, error) {
-	fh, err := os.Open(path)
+	path := filepath.Join(ourCacheDir, newestFile.Name())
+	al, err := FromTerseFile(path)
 	if err != nil {
-		return nil, &CacheError{
-			Action: "open file", Path: ourCacheDir, BaseError: err}
+		return nil, err
+	} else if al.AsOf.Unix() != latestTime {
+		const YYYMMDDhhmmss = "2006-01-02 15:04:05Z"
+		const action = "cannot use latest cache file"
+		problem := fmt.Sprintf("name ⇒ fetched %s but header says %q",
+			time.Unix(latestTime, 0).UTC().Format(YYYMMDDhhmmss),
+			al.AsOf.UTC().Format(YYYMMDDhhmmss))
+		logBug(nil, action[7:], path, true, "%s", problem)
+		err = &CacheError{ Action: action , Path: path, Problem: problem}
+		return nil, err
+	} else {
+		return al, nil
 	}
-	defer fh.Close()
-	return FromSimpleFormat(fh, path, true)
 }
 
 func FromJSONFile(path string) (*AppList, error) {
@@ -195,11 +152,10 @@ func fetchAndCache() (*AppList, error) {
 
 	newFilePath := filepath.Join(
 		ourCacheDir,
-		fmt.Sprintf(cacheFileNameFormat, unixTime))
-	err = al.WriteFile(newFilePath,
-		os.O_CREATE|os.O_WRONLY|os.O_EXCL)
+		fmt.Sprintf(formatCacheName, unixTime))
+	err = al.WriteTerseFile(newFilePath)
 	if err != nil {
-		// os.IsExistg(err) ???
+		// os.IsExist(err) ???
 		return nil, err
 	}
 
@@ -294,6 +250,24 @@ func (al *AppList) FindNumberForNameUC(targetName string) (int, SteamAppID) {
 	return i, appID
 }
 
+/*============================= Filesystem Paths =============================*/
+
+const ourDirName = "BigAppLists"
+
+var (
+	ourCacheDir = filepath.Join(steamAPI.CacheDirPath(), ourDirName)
+
+	regexpCacheName = regexp.MustCompile(`^SteamAppList@(\d+)\.txt$`)
+	formatCacheName = "SteamAppList@%d.txt"
+
+	// The first line of a terse-format file must look like it was written by:
+	//	fmt.Printf(formatHeaderLine, URL, al.AsOf.UTC().Format(formatHeaderTime))
+	formatHeaderLine = `"From %s as of %s"`
+	formatHeaderTime = `2006-01-02 15:04:05Z`
+	regexpHeaderLine = regexp.MustCompile(
+		`^"From [^\t ]+ as of (\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\dZ)"$`)
+)
+
 /*================================== Errors ==================================*/
 
 func logBug(data []byte, prefix, source string, isFile bool,
@@ -302,11 +276,14 @@ func logBug(data []byte, prefix, source string, isFile bool,
 	if isFile {
 		source = fmt.Sprintf("file %q", source)
 	}
-	output := fmt.Sprintf(
-		"\n%s (prog %s) %s %s %s\n",
+	output := fmt.Sprintf(format, args...)
+	if output[1] != '\n' {
+		output = " " + output
+	}
+	output = fmt.Sprintf(
+		"\n%s (prog %s) %s %s%s\n",
 		time.Now().Format("2006-01-02 15:04:05Z"),
-		os.Args[0], prefix, source,
-		fmt.Sprintf(format, args...))
+		os.Args[0], prefix, source, output)
 	if len(data) > 0 {
 		output += fmt.Sprintf("  %q\n", data)
 	}
@@ -314,11 +291,11 @@ func logBug(data []byte, prefix, source string, isFile bool,
 	BugsLogPath := filepath.Join(ourCacheDir, "BUGS.log")
 	fh, err := os.OpenFile(BugsLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o666)
 	if err != nil {
-		fh = os.Stderr
 		intro := fmt.Sprintf(
-			"%s: could not append following to file %q (%s): \n ",
-			filepath.Base(os.Args[0]), BugsLogPath)
+			"%s: could not append following to file %q (%s):\n ",
+			filepath.Base(os.Args[0]), BugsLogPath, err)
 		output = intro + output[1:]
+		fh = os.Stderr
 	}
 	fmt.Fprint(fh, output)
 	fh.Sync()
@@ -326,13 +303,20 @@ func logBug(data []byte, prefix, source string, isFile bool,
 }
 
 type CacheError struct {
-	Action    string
-	Path      string
-	BaseError error
+	Action    string // What we were trying to do
+	Path      string // Which file/dir we tried to do that to
+	BaseError error  // Error from lower-level code
+	Problem   string // Iff BaseError is nil: details
 }
 
 func (e *CacheError) Error() string {
-	return fmt.Sprintf("cannot %s %q: %s", e.Action, e.Path, e.BaseError)
+	problem := ""
+	if e.BaseError != nil {
+		problem = tidyError(e.BaseError)
+	} else {
+		problem = e.Problem
+	}
+	return fmt.Sprintf("cannot %s %q: %s", e.Action, e.Path, problem)
 }
 
 func (e *CacheError) Unwrap() error { return e.BaseError }
@@ -362,3 +346,12 @@ func (e *WebError) Error() string {
 }
 
 func (e *WebError) Unwrap() error { return e.BaseError }
+
+//
+
+func tidyError(e error) string {
+	if pe, isPathErr := e.(*os.PathError); isPathErr {
+		e = pe.Unwrap()
+	}
+	return e.Error()
+}

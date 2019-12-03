@@ -36,7 +36,7 @@ func ConfigDirPath() string {
 			panic("os.UserConfigDir() failed: " + err.Error())
 		}
 		moduleConfigDir = filepath.Join(dir, baseDirsRelPath)
-		ensureDirExists(moduleConfigDir)
+		EnsureDirExists(moduleConfigDir)
 	}
 	return moduleConfigDir
 }
@@ -48,16 +48,17 @@ func CacheDirPath() string {
 			panic("os.UserCacheDir() failed: " + err.Error())
 		}
 		moduleCacheDir = filepath.Join(dir, baseDirsRelPath)
-		ensureDirExists(moduleCacheDir)
+		EnsureDirExists(moduleCacheDir)
 	}
 	return moduleCacheDir
 }
 
-func ensureDirExists(path string) {
+func EnsureDirExists(path string) {
 	fi, err := os.Stat(path)
 	if os.IsNotExist(err) {
 		err = os.MkdirAll(path, 0o744)
 	}
+	// ???XXX Is panic() good enough here?
 	if err != nil || (fi != nil && !fi.IsDir()) {
 		panic(fmt.Sprintf("SteamAPI needs directory at %q", path))
 	}

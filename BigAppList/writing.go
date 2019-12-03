@@ -7,35 +7,15 @@ import (
 	"os"
 )
 
-func (al *AppList) WriteSimple(w io.Writer, destDesc string, isFile bool) error {
-	bufWriter := bufio.NewWriter(w)
-	defer bufWriter.Flush()
-
-	heading := `"From ` + URL +
-		al.AsOf.Format(`as of 2006-01-02 15:04:05Z"`+"\n")
-	_, err := fmt.Fprintf(bufWriter, heading)
-
-	for i := 0; err == nil && i < al.Count; i++ {
-		name := fmt.Sprintf("%q", al.ByAppNum[i].Name)
-		fmt.Fprintf(bufWriter, "%d\t%s\n",
-			al.ByAppNum[i].ID, name[1:len(name)-1])
-	}
-
-	if err != nil {
-		return &WriteError{Action: "write to",
-			Dest: destDesc, IsFile: isFile, BaseError: err}
-	}
-	return nil
-}
-
-func (al *AppList) WriteFile(path string, mode int) error {
+func (al *AppList) WriteTerseFile(path string) error {
+	const mode = os.O_CREATE | os.O_WRONLY | os.O_EXCL
 	fh, err := os.OpenFile(path, mode, 0o666)
 	if err != nil {
 		return &WriteError{Action: "create",
 			Dest: path, IsFile: true, BaseError: err}
 	}
 
-	err = al.WriteSimple(fh, path, true)
+	err = al.WriteTerse(fh, path, true)
 	if err != nil {
 		return err
 	}
@@ -51,6 +31,27 @@ func (al *AppList) WriteFile(path string, mode int) error {
 			Dest: path, IsFile: true, BaseError: err}
 	}
 
+	return nil
+}
+
+func (al *AppList) WriteTerse(w io.Writer, destDesc string, isFile bool) error {
+	bufWriter := bufio.NewWriter(w)
+	defer bufWriter.Flush()
+
+	heading := fmt.Sprintf(formatHeaderLine+"\n",
+		URL, al.AsOf.UTC().Format(formatHeaderTime))
+	_, err := fmt.Fprintf(bufWriter, heading)
+
+	for i := 0; err == nil && i < al.Count; i++ {
+		name := fmt.Sprintf("%q", al.ByAppNum[i].Name)
+		fmt.Fprintf(bufWriter, "%d\t%s\n",
+			al.ByAppNum[i].ID, name[1:len(name)-1])
+	}
+
+	if err != nil {
+		return &WriteError{Action: "write to",
+			Dest: destDesc, IsFile: isFile, BaseError: err}
+	}
 	return nil
 }
 
