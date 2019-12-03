@@ -96,6 +96,8 @@ func fixCP1252(s string, posC2 int, number int64, source string, isFile bool) st
 			newB = append(newB, "™"...)
 		case 0x92:
 			newB = append(newB, "’"...)
+		case 0xA0:
+			newB = append(newB, "\u00A0"...)
 		default:
 			code := s[posC2+1]
 			newB = append(newB, 0xC2, code)
